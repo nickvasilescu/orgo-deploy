@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""orgo-deploy: serve an app running on this Orgo computer at its own https://<name>.orgo.dev URL.
+
+  orgo-deploy up <dir> [--name N] [--cmd "start command"] [--port P] [--public] [--json]
+  orgo-deploy list [--json]
+  orgo-deploy logs <name> [-n LINES]
+  orgo-deploy restart <name>
+  orgo-deploy rm <name>
+  orgo-deploy setup            save an Orgo API key on this computer
+  orgo-deploy whoami           show this computer's ID and URL usage
+
+Apps run under supervisord, so they restart on crash and come back after a reboot. By default each
+app sits behind a small gate that asks for a per-app key; the printed link carries the key. --public
+skips the gate. Needs an Orgo API key (ORGO_API_KEY, or `orgo-deploy setup`). Stdlib only.
+"""
+import argparse, fcntl, json, os, re, secrets, shlex, shutil, socket, ssl, subprocess, sys, threading, time
+import urllib.error, urllib.parse, urllib.request
+from pathlib import Path
+
+API = os.environ.get("ORGO_API_BASE", "https://www.orgo.ai/api")
+CONF = Path("/etc/orgo-deploy/env")
+STATE_DIR = Path("/var/lib/orgo-deploy")
+STATE = STATE_DIR / "apps.json"
+RUN_DIR = STATE_DIR / "run"
+LOG_DIR = Path("/var/log/orgo-deploy")
+SUP_DIR = Path("/etc/supervisor/conf.d")
+APP_PORTS = range(21000, 21500)
+GATE_PORTS = range(21500, 22000)
+RESERVED = {8080}  # Orgo's desktop API
+COOKIE = "orgo_deploy_"
+
+
+def die(msg, code=1):
+    print(f"orgo-deploy: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------- config & state ----------
+
+def read_conf():
+    out = {}
+    if CONF.exists():
+        for line in CONF.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip("'\"")
+    for k in ("ORGO_API_KEY", "ORGO_COMPUTER_ID"):
+        if os.environ.get(k):
+            out[k] = os.environ[k]
+    return out
+
+
+def write_conf(updates):
+    cur = {}
+    if CONF.exists():
+        for line in CONF.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                cur[k.strip()] = v.strip()
+    cur.update(updates)
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        CONF.write_text("".join(f"{k}={v}\n" for k, v in cur.items()))
+    finally:
+        os.umask(old)
+    os.chmod(CONF, 0o600)
+
+
+class State:
+    """apps.json under an exclusive lock for the whole command."""
+
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.lock = open(STATE_DIR / ".lock", "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.apps = json.loads(STATE.read_text()) if STATE.exists() else {}
+        return self
+
+    def save(self):
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.apps, indent=2))
+        os.chmod(tmp, 0o600)
+        tmp.replace(STATE)
+
+    def __exit__(self, *a):
+        self.lock.close()
+
+
+def load_apps():
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+
+
+# ---------- Orgo API ----------
+
+class ApiError(Exception):
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+        try:
+            j = json.loads(body)
+        except Exception:
+            j = {}
+        self.code = j.get("code")
+        super().__init__(f"HTTP {status}: {j.get('error') or body[:200]}")
+
+
+def api(method, path, body=None, key=None, timeout=60):
+    key = key or read_conf().get("ORGO_API_KEY")
+    if not key:
+        die("no Orgo API key. Run `orgo-deploy setup` (or set ORGO_API_KEY).")
+    req = urllib.request.Request(API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                          "User-Agent": "orgo-deploy/0.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        raise ApiError(e.code, e.read().decode(errors="replace"))
+
+
+def computer_id():
+    """This computer's Orgo ID. Orgo doesn't expose it on the box, so find ourselves once by
+    dropping a nonce file and asking each running computer the key can see to read it back."""
+    conf = read_conf()
+    if conf.get("ORGO_COMPUTER_ID"):
+        return conf["ORGO_COMPUTER_ID"]
+    nonce = secrets.token_hex(16)
+    marker = Path("/run/orgo-deploy.whoami")
+    marker.write_text(nonce)
+    try:
+        ws = api("GET", "/workspaces").get("workspaces", [])
+        for w in ws:
+            for c in api("GET", f"/workspaces/{w['id']}").get("desktops", []):
+                if c.get("status") != "running" or c.get("os", "linux") != "linux":
+                    continue
+                try:
+                    out = api("POST", f"/computers/{c['id']}/bash",
+                              {"command": f"cat {marker} 2>/dev/null", "timeout": 10}, timeout=40)
+                except Exception:
+                    continue
+                if nonce in (out.get("output") or ""):
+                    write_conf({"ORGO_COMPUTER_ID": c["id"]})
+                    say(f"this computer is {c.get('name')} ({c['id']}); saved")
+                    return c["id"]
+    finally:
+        marker.unlink(missing_ok=True)
+    die("couldn't identify this computer with that API key. Set ORGO_COMPUTER_ID in /etc/orgo-deploy/env.")
+
+
+# ---------- supervisor ----------
+
+def sup(*args, check=True):
+    r = subprocess.run(["supervisorctl", *args], capture_output=True, text=True)
+    if check and r.returncode not in (0, 3):  # 3 = some program not running, reported in stdout
+        die(f"supervisorctl {' '.join(args)} failed: {(r.stdout + r.stderr).strip()}")
+    return r.stdout
+
+
+def sup_running(prog):
+    return " RUNNING " in sup("status", prog, check=False)
+
+
+def write_programs(name, app):
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    launcher = RUN_DIR / f"{name}.sh"
+    env_lines = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in app["env"].items())
+    launcher.write_text(f"#!/bin/bash\n# generated by orgo-deploy\ncd {shlex.quote(app['dir'])} || exit 1\n"
+                        f"{env_lines}exec {app['cmd']}\n")
+    launcher.chmod(0o755)
+    common = ("autostart=true\nautorestart=true\nstartsecs=2\nstartretries=1000\nstopasgroup=true\n"
+              "killasgroup=true\nredirect_stderr=true\nstdout_logfile_maxbytes=5MB\nstdout_logfile_backups=1\n")
+    conf = f"[program:orgo-app-{name}]\ncommand={launcher}\n{common}stdout_logfile={LOG_DIR}/{name}.log\n"
+    if not app["public"]:
+        conf += (f"\n[program:orgo-gate-{name}]\ncommand={Path(__file__).resolve()} gate {name}\n{common}"
+                 f"stdout_logfile={LOG_DIR}/{name}.gate.log\n")
+    (SUP_DIR / f"orgo-deploy-{name}.conf").write_text(conf)
+    sup("reread")
+    sup("update")
+
+
+def remove_programs(name):
+    p = SUP_DIR / f"orgo-deploy-{name}.conf"
+    if p.exists():
+        p.unlink()
+        sup("reread", check=False)
+        sup("update", check=False)
+    (RUN_DIR / f"{name}.sh").unlink(missing_ok=True)
+
+
+# ---------- detection ----------
+
+def run(cmd, cwd, env=None):
+    say(f"  $ {cmd}")
+    r = subprocess.run(cmd, shell=True, cwd=cwd, env={**os.environ, **(env or {})},
+                       stdout=sys.stderr, stderr=sys.stderr)
+    if r.returncode:
+        die(f"`{cmd}` failed in {cwd} (exit {r.returncode})")
+
+
+def static_dir(d):
+    for sub in ("dist", "build", "out", "public", "."):
+        if (d / sub / "index.html").exists():
+            return (d / sub).resolve()
+    return None
+
+
+def prepare(d, cmd, port_env):
+    """Install/build as needed and return the start command. The app must listen on $PORT."""
+    if cmd:
+        return cmd, "custom"
+    pkg = d / "package.json"
+    if pkg.exists():
+        scripts = json.loads(pkg.read_text()).get("scripts", {})
+        if not (d / "node_modules").exists():
+            run("npm ci --no-audit --no-fund" if (d / "package-lock.json").exists()
+                else "npm install --no-audit --no-fund", d)
+        if "build" in scripts:
+            run("npm run build", d, port_env)
+        if "start" in scripts:
+            return "npm start", "node (npm start)"
+        sd = static_dir(d)
+        if sd:
+            return f"python3 -m http.server $PORT --bind 127.0.0.1 --directory {shlex.quote(str(sd))}", "static (built)"
+        die("package.json has no start script and the build left no index.html. Pass --cmd.")
+    reqs = d / "requirements.txt"
+    pyfiles = [f for f in ("app.py", "main.py", "server.py", "streamlit_app.py") if (d / f).exists()]
+    if reqs.exists() or (d / "pyproject.toml").exists():
+        venv = d / ".venv"
+        if not venv.exists():
+            run(f"python3 -m venv {shlex.quote(str(venv))}", d)
+        py = venv / "bin" / "python"
+        if reqs.exists():
+            run(f"{py} -m pip install -q -r requirements.txt", d)
+        text = reqs.read_text().lower() if reqs.exists() else (d / "pyproject.toml").read_text().lower()
+        entry = pyfiles[0] if pyfiles else None
+        if "streamlit" in text and entry:
+            return (f"{venv}/bin/streamlit run {entry} --server.port $PORT --server.address 127.0.0.1 "
+                    "--server.headless true"), "python (streamlit)"
+        if entry and re.search(r"fastapi|uvicorn", text) and re.search(r"^\s*app\s*=", (d / entry).read_text(), re.M):
+            return f"{venv}/bin/uvicorn {entry[:-3]}:app --host 127.0.0.1 --port $PORT", "python (uvicorn)"
+        if entry:
+            return f"{py} {entry}", "python"
+        die("Python project without app.py/main.py/server.py. Pass --cmd.")
+    if pyfiles:
+        return f"python3 {pyfiles[0]}", "python"
+    sd = static_dir(d)
+    if sd:
+        return f"python3 -m http.server $PORT --bind 127.0.0.1 --directory {shlex.quote(str(sd))}", "static"
+    die(f"can't tell how to start {d}. Pass --cmd 'your start command' (it must listen on $PORT).")
+
+
+# ---------- ports & names ----------
+
+def port_free(p):
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", p))
+            return True
+        except OSError:
+            return False
+
+
+def pick_port(rng, taken):
+    for p in rng:
+        if p not in taken and p not in RESERVED and port_free(p):
+            return p
+    die("no free port left in the orgo-deploy range")
+
+
+def slug(s):
+    s = re.sub(r"[^a-z0-9-]+", "-", s.lower()).strip("-")
+    s = re.sub(r"-{2,}", "-", s)[:40].strip("-")
+    return s if len(s) >= 3 else f"app-{secrets.token_hex(2)}"
+
+
+def wait_listen(port, prog, secs):
+    end = time.time() + secs
+    while time.time() < end:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                return True
+        except OSError:
+            pass
+        time.sleep(1)
+    return False
+
+
+# ---------- public URLs ----------
+
+def create_url(cid, port, label, st, keep):
+    """Attach https://<label>.orgo.dev to port. Adds a suffix on a clash; at the account cap,
+    frees the oldest URL this tool made on this computer (never anything else)."""
+    tries = [label, f"{label}-{secrets.token_hex(2)}", f"{label}-{secrets.token_hex(2)}"]
+    recycled = False
+    i = 0
+    while i < len(tries):
+        info = api("GET", f"/computers/{cid}/public-urls")
+        if info.get("account_used", 0) >= info.get("account_limit", 10) and not recycled:
+            victims = sorted((a for n, a in st.apps.items() if n not in keep and a.get("url_id")),
+                             key=lambda a: a.get("deployed_at", 0))
+            if not victims:
+                die(f"all {info.get('account_limit')} orgo.dev names on this account are in use, none by "
+                    "orgo-deploy apps here. Free one in the Orgo dashboard or with `orgo-deploy rm`.")
+            v = victims[0]
+            say(f"→ at the {info.get('account_limit')}-URL limit: recycling oldest app '{v['name']}' ({v['url']})")
+            teardown(st, v["name"], cid)
+            recycled = True
+        try:
+            return api("POST", f"/computers/{cid}/public-urls", {"port": port, "label": tries[i]})
+        except ApiError as e:
+            if e.status == 409 or e.code == "LABEL_TAKEN":
+                say(f"→ {tries[i]}.orgo.dev is taken; trying another name")
+                i += 1
+                continue
+            raise
+    die(f"couldn't get an orgo.dev name starting with {label}")
+
+
+def verify(url, health_path, secs=90):
+    """Hit the public URL through Orgo's edge until it answers (cert issuance can take a few seconds)."""
+    ctx = ssl.create_default_context()
+    end, last = time.time() + secs, ""
+    while time.time() < end:
+        try:
+            req = urllib.request.Request(url.rstrip("/") + health_path, headers={"User-Agent": "orgo-deploy/0.1"})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+                return r.status, ""
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return e.code, ""
+            last = f"HTTP {e.code}"
+        except Exception as e:  # DNS/TLS not ready yet
+            last = str(e)
+        time.sleep(3)
+    return None, last
+
+
+# ---------- commands ----------
+
+def teardown(st, name, cid):
+    app = st.apps.get(name)
+    if not app:
+        return
+    remove_programs(name)
+    if app.get("url_id"):
+        try:
+            api("DELETE", f"/computers/{cid}/public-urls/{app['url_id']}")
+        except ApiError as e:
+            if e.status != 404:
+                say(f"warning: couldn't delete {app['url']}: {e}")
+    st.apps.pop(name, None)
+    st.save()
+
+
+def cmd_up(a):
+    d = Path(a.dir).expanduser().resolve()
+    if not d.is_dir():
+        die(f"{d} is not a directory")
+    name = slug(a.name or d.name)
+    cid = computer_id()
+    with State() as st:
+        old = st.apps.get(name, {})
+        taken = {x["app_port"] for x in st.apps.values()} | {x.get("gate_port") for x in st.apps.values()}
+        app_port = a.port or old.get("app_port") or pick_port(APP_PORTS, taken)
+        public = a.public if a.public is not None else old.get("public", False)
+        gate_port = None if public else (old.get("gate_port") or pick_port(GATE_PORTS, taken | {app_port}))
+        port_env = {"PORT": str(app_port), "HOST": "127.0.0.1"}
+        say(f"→ preparing {d}")
+        cmd, kind = prepare(d, a.cmd or old.get("custom_cmd"), port_env)
+        app = {**old, "name": name, "dir": str(d), "cmd": cmd, "kind": kind, "app_port": app_port,
+               "gate_port": gate_port, "public": public, "custom_cmd": a.cmd or old.get("custom_cmd"),
+               "env": {**port_env, "NODE_ENV": "production"},
+               "token": old.get("token") or secrets.token_urlsafe(18), "deployed_at": time.time()}
+        target = app_port if public else gate_port
+        # URL first, so the cap/collision handling happens before anything starts.
+        if not old.get("url_id") or old.get("url_port") != target:
+            if old.get("url_id"):
+                try:
+                    api("DELETE", f"/computers/{cid}/public-urls/{old['url_id']}")
+                except ApiError:
+                    pass
+            u = create_url(cid, target, old.get("label") or name, st, keep={name})
+            app.update(url=u["url"], url_id=u["id"], label=u["label"], url_port=target)
+        st.apps[name] = app
+        st.save()
+        write_programs(name, app)
+        sup("restart", f"orgo-app-{name}", check=False)
+        if not public:
+            sup("restart", f"orgo-gate-{name}", check=False)
+        say(f"→ starting ({kind}) on port {app_port}")
+        if not wait_listen(app_port, f"orgo-app-{name}", a.wait):
+            tail = subprocess.run(["tail", "-n", "25", str(LOG_DIR / f"{name}.log")], capture_output=True,
+                                  text=True).stdout
+            die(f"the app didn't start listening on port {app_port} within {a.wait}s. It must listen on $PORT "
+                f"({app_port}); if it uses a fixed port, pass --port <that port>.\n--- last log lines ---\n{tail}")
+        status, err = verify(app["url"], "/" if public else "/__orgo_deploy/health")
+        if status is None or status >= 500:
+            die(f"app is running locally but {app['url']} isn't answering yet ({err}). Retry: "
+                f"orgo-deploy restart {name}")
+    link = app["url"] if public else f"{app['url']}/?key={app['token']}"
+    out = {"name": name, "url": app["url"], "link": link, "private": not public, "port": app_port,
+           "kind": kind, "logs": f"orgo-deploy logs {name}"}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        print(f"Deployed {name}\n  Link:  {link}")
+        print("         (private: the key in the link is the password; anyone with the link can open it)"
+              if not public else "         (public: anyone with the URL can open it)")
+        print(f"  App:   {kind}, port {app_port}\n  Logs:  orgo-deploy logs {name}")
+
+
+def cmd_list(a):
+    apps = load_apps()
+    rows = []
+    for n, x in sorted(apps.items(), key=lambda kv: kv[1].get("deployed_at", 0)):
+        up = sup_running(f"orgo-app-{n}")
+        link = x["url"] if x.get("public") else f"{x['url']}/?key={x['token']}"
+        rows.append({"name": n, "status": "running" if up else "down", "link": link, "dir": x["dir"],
+                     "kind": x.get("kind")})
+    if a.json:
+        print(json.dumps(rows))
+        return
+    if not rows:
+        print("no apps deployed")
+    for r in rows:
+        print(f"{r['name']:<24} {r['status']:<8} {r['link']}")
+
+
+def cmd_rm(a):
+    cid = computer_id()
+    with State() as st:
+        if a.name not in st.apps:
+            die(f"no app named {a.name}")
+        url = st.apps[a.name]["url"]
+        teardown(st, a.name, cid)
+    print(f"removed {a.name} ({url})")
+
+
+def cmd_logs(a):
+    p = LOG_DIR / f"{a.name}.log"
+    if not p.exists():
+        die(f"no logs for {a.name}")
+    os.execvp("tail", ["tail", "-n", str(a.n), str(p)])
+
+
+def cmd_restart(a):
+    apps = load_apps()
+    if a.name not in apps:
+        die(f"no app named {a.name}")
+    sup("restart", f"orgo-app-{a.name}", check=False)
+    if not apps[a.name].get("public"):
+        sup("restart", f"orgo-gate-{a.name}", check=False)
+    print(f"restarted {a.name}")
+
+
+def cmd_setup(a):
+    key = a.key or os.environ.get("ORGO_API_KEY")
+    if not key:
+        import getpass
+        key = getpass.getpass("Orgo API key (orgo.ai > Settings > API keys): ").strip()
+    if not key:
+        die("no key given")
+    api("GET", "/workspaces", key=key)  # validates
+    write_conf({"ORGO_API_KEY": key})
+    print(f"saved to {CONF} (mode 600)")
+    cmd_whoami(a)
+
+
+def cmd_whoami(a):
+    cid = computer_id()
+    info = api("GET", f"/computers/{cid}/public-urls")
+    print(f"computer {cid}: {info.get('account_used')}/{info.get('account_limit')} orgo.dev URLs used on this account")
+
+
+# ---------- the gate ----------
+
+LOGIN_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Private app</title><style>body{font:16px system-ui;display:grid;place-items:center;min-height:100vh;margin:0;
+background:#0b0b0c;color:#eee}form{display:flex;gap:8px}input{padding:10px;border-radius:8px;border:1px solid #444;
+background:#151517;color:#eee;width:260px}button{padding:10px 14px;border-radius:8px;border:0;background:#eee;color:#111}
+p{color:#999;font-size:14px}</style><div><h2>This app is private</h2><p>Open it with the link you were given, or paste
+the key.</p><form method=get action="/"><input name=key placeholder="access key" autofocus><button>Open</button></form></div>"""
+
+
+HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te",
+       "trailer", "trailers", "transfer-encoding", "upgrade"}
+
+
+def pipe(src, dst):
+    try:
+        while True:
+            b = src.recv(65536)
+            if not b:
+                break
+            dst.sendall(b)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def make_gate(app_port, token, cookie_name):
+    """An HTTP/1.1 reverse proxy that checks the key on EVERY request. Orgo's edge pools upstream
+    connections across visitors, so a per-connection check would let strangers ride an authed one."""
+    import http.client
+    from http.server import BaseHTTPRequestHandler
+
+    class Gate(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "orgo-deploy"
+
+        def log_message(self, fmt, *args):
+            pass
+
+        def reply(self, status, body=b"", ctype="text/plain; charset=utf-8", extra=()):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def read_body(self):
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                out = b""
+                while True:
+                    size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                    if size == 0:
+                        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                            pass
+                        return out
+                    out += self.rfile.read(size)
+                    self.rfile.readline()
+            n = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(n) if n else None
+
+        def authed(self):
+            for part in "; ".join(self.headers.get_all("Cookie") or []).split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == cookie_name and secrets.compare_digest(v, token):
+                    return True
+            return False
+
+        def handle_any(self):
+            u = urllib.parse.urlsplit(self.path)
+            if u.path == "/__orgo_deploy/health":
+                try:
+                    socket.create_connection(("127.0.0.1", app_port), timeout=3).close()
+                    return self.reply(200, b"ok")
+                except OSError:
+                    return self.reply(503, b"app not listening")
+            q = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+            if "key" in q:
+                self.read_body()
+                if secrets.compare_digest(q["key"][0], token):
+                    rest = urllib.parse.urlencode([(k, v) for k, vs in q.items() if k != "key" for v in vs])
+                    return self.reply(302, b"", extra=(
+                        ("Location", (u.path or "/") + (f"?{rest}" if rest else "")),
+                        ("Set-Cookie", f"{cookie_name}={token}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax")))
+                return self.reply(401, LOGIN_PAGE.encode(), "text/html; charset=utf-8")
+            if not self.authed():
+                self.read_body()
+                return self.reply(401, LOGIN_PAGE.encode(), "text/html; charset=utf-8")
+            if "upgrade" in (self.headers.get("Connection") or "").lower():
+                return self.tunnel()
+            body = self.read_body()
+            hdrs = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"content-length", "host"}}
+            hdrs["Host"] = self.headers.get("Host", "")
+            if body is not None:
+                hdrs["Content-Length"] = str(len(body))
+            try:
+                up = http.client.HTTPConnection("127.0.0.1", app_port, timeout=300)
+                up.request(self.command, self.path, body=body, headers=hdrs)
+                r = up.getresponse()
+            except OSError:
+                return self.reply(502, b"The app isn't running right now. It restarts automatically; try again in a few seconds.")
+            self.send_response(r.status, r.reason)
+            chunked = False
+            no_body = self.command == "HEAD" or r.status in (204, 304) or 100 <= r.status < 200
+            for k, v in r.getheaders():
+                if k.lower() not in HOP | {"content-length"}:
+                    self.send_header(k, v)
+            if not no_body:
+                if r.length is not None:
+                    self.send_header("Content-Length", str(r.length))
+                else:
+                    self.send_header("Transfer-Encoding", "chunked")
+                    chunked = True
+            self.end_headers()
+            if not no_body:
+                while True:
+                    b = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                    if not b:
+                        break
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(b), b) if chunked else b)
+                    self.wfile.flush()
+                if chunked:
+                    self.wfile.write(b"0\r\n\r\n")
+            up.close()
+
+        def tunnel(self):
+            """WebSocket and other upgrades: replay the request, then splice the sockets."""
+            try:
+                up = socket.create_connection(("127.0.0.1", app_port), timeout=10)
+            except OSError:
+                return self.reply(502, b"app not running")
+            head = f"{self.command} {self.path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
+            up.sendall(head.encode("latin-1") + b"\r\n")
+            up.settimeout(None)
+            self.wfile.flush()
+            # Clients wait for the 101 before sending frames, so nothing is left buffered in rfile.
+            self.close_connection = True
+            t = threading.Thread(target=pipe, args=(up, self.connection), daemon=True)
+            t.start()
+            pipe(self.connection, up)
+            t.join(timeout=1)
+
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = handle_any
+
+    return Gate
+
+
+def cmd_gate(a):
+    from http.server import ThreadingHTTPServer
+    app = load_apps().get(a.name) or die(f"no app named {a.name}")
+    cookie = COOKIE + re.sub(r"[^a-z0-9]", "_", a.name)
+
+    class Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if socket.has_dualstack_ipv6() else socket.AF_INET
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def server_bind(self):
+            if self.address_family == socket.AF_INET6:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            super().server_bind()
+
+    srv = Server(("", app["gate_port"]), make_gate(app["app_port"], app["token"], cookie))
+    print(f"gate for {a.name}: :{app['gate_port']} -> 127.0.0.1:{app['app_port']}", flush=True)
+    srv.serve_forever()
+
+
+def main():
+    if os.geteuid() != 0:
+        die("run as root (it manages supervisord programs)")
+    if not shutil.which("supervisorctl"):
+        die("supervisord isn't installed on this computer")
+    p = argparse.ArgumentParser(prog="orgo-deploy", description=__doc__.split("\n\n")[0])
+    sp = p.add_subparsers(dest="command", required=True)
+    up = sp.add_parser("up", help="deploy or redeploy an app directory")
+    up.add_argument("dir")
+    up.add_argument("--name", help="app and URL name (default: directory name)")
+    up.add_argument("--cmd", help="start command; must listen on $PORT")
+    up.add_argument("--port", type=int, help="the app listens on this fixed port instead of $PORT")
+    up.add_argument("--public", action="store_true", default=None, help="no key gate: anyone with the URL can open it")
+    up.add_argument("--private", dest="public", action="store_false", help="put the key gate back")
+    up.add_argument("--wait", type=int, default=90, help="seconds to wait for the app to listen")
+    up.add_argument("--json", action="store_true")
+    ls = sp.add_parser("list", help="list deployed apps")
+    ls.add_argument("--json", action="store_true")
+    for n in ("rm", "restart", "gate"):
+        sp.add_parser(n).add_argument("name")
+    lg = sp.add_parser("logs")
+    lg.add_argument("name")
+    lg.add_argument("-n", type=int, default=100)
+    st = sp.add_parser("setup", help="save an Orgo API key on this computer")
+    st.add_argument("--key", help=argparse.SUPPRESS)
+    sp.add_parser("whoami")
+    a = p.parse_args()
+    {"up": cmd_up, "list": cmd_list, "rm": cmd_rm, "logs": cmd_logs, "restart": cmd_restart,
+     "gate": cmd_gate, "setup": cmd_setup, "whoami": cmd_whoami}[a.command](a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ApiError as e:
+        die(f"Orgo API error: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
