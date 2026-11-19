@@ -468,8 +468,14 @@ def cmd_setup(a):
         key = getpass.getpass("Orgo API key (orgo.ai > Settings > API keys): ").strip()
     if not key:
         die("no key given")
-    api("GET", "/workspaces", key=key)  # validates
-    write_conf({"ORGO_API_KEY": key})
+    if a.computer_id:
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", a.computer_id):
+            die("--computer-id should be the computer's UUID (Orgo dashboard > the computer > its ID)")
+        api("GET", f"/computers/{a.computer_id}/public-urls", key=key)  # validates key + computer
+        write_conf({"ORGO_API_KEY": key, "ORGO_COMPUTER_ID": a.computer_id})
+    else:
+        api("GET", "/workspaces", key=key)  # validates
+        write_conf({"ORGO_API_KEY": key})
     print(f"saved to {CONF} (mode 600)")
     cmd_whoami(a)
 
@@ -552,7 +558,7 @@ def make_gate(app_port, token, cookie_name):
         def authed(self):
             for part in "; ".join(self.headers.get_all("Cookie") or []).split(";"):
                 k, _, v = part.strip().partition("=")
-                if k == cookie_name and secrets.compare_digest(v, token):
+                if k == cookie_name and secrets.compare_digest(v.encode(), token.encode()):
                     return True
             return False
 
@@ -566,15 +572,17 @@ def make_gate(app_port, token, cookie_name):
                     return self.reply(503, b"app not listening")
             q = urllib.parse.parse_qs(u.query, keep_blank_values=True)
             if "key" in q:
-                self.read_body()
-                if secrets.compare_digest(q["key"][0], token):
+                # Don't read a body we haven't authorized (an unbounded body would sit in memory).
+                self.close_connection = True
+                if secrets.compare_digest(q["key"][0].encode(), token.encode()):
                     rest = urllib.parse.urlencode([(k, v) for k, vs in q.items() if k != "key" for v in vs])
+                    path = "/" + (u.path or "/").lstrip("/")  # never "//host": no protocol-relative redirect
                     return self.reply(302, b"", extra=(
-                        ("Location", (u.path or "/") + (f"?{rest}" if rest else "")),
+                        ("Location", path + (f"?{rest}" if rest else "")),
                         ("Set-Cookie", f"{cookie_name}={token}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax")))
                 return self.reply(401, LOGIN_PAGE.encode(), "text/html; charset=utf-8")
             if not self.authed():
-                self.read_body()
+                self.close_connection = True
                 return self.reply(401, LOGIN_PAGE.encode(), "text/html; charset=utf-8")
             if "upgrade" in (self.headers.get("Connection") or "").lower():
                 return self.tunnel()
@@ -680,6 +688,7 @@ def main():
     lg.add_argument("-n", type=int, default=100)
     st = sp.add_parser("setup", help="save an Orgo API key on this computer")
     st.add_argument("--key", help=argparse.SUPPRESS)
+    st.add_argument("--computer-id", help="this computer's Orgo ID; skips looking itself up across the key's computers")
     sp.add_parser("whoami")
     a = p.parse_args()
     {"up": cmd_up, "list": cmd_list, "rm": cmd_rm, "logs": cmd_logs, "restart": cmd_restart,

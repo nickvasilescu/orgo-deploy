@@ -17,10 +17,10 @@ On the Orgo computer, as root. The `system/hermes-agent` template is a good home
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nickvasilescu/orgo-deploy/main/install.sh | bash
-orgo-deploy setup     # paste an Orgo API key (orgo.ai → Settings → API keys); stays on this computer
+orgo-deploy setup --computer-id <this computer's ID>   # paste a workspace-scoped Orgo key, never your main key
 ```
 
-This puts `orgo-deploy` in `/usr/local/bin`, and the skill in `~/.hermes/skills/devops/deploy-to-orgo/` when Hermes is installed. `setup` also works out which Orgo computer it's on.
+This puts `orgo-deploy` in `/usr/local/bin`, and the skill in `~/.hermes/skills/devops/deploy-to-orgo/` when Hermes is installed. Without `--computer-id`, `setup` works out which Orgo computer it's on (see Limits).
 
 Then ask your agent to build something and give you a link.
 
@@ -57,17 +57,28 @@ Redeploying with the same name keeps the URL and the key.
 
 - **Apps live only while the computer runs.** This is for using what your agent builds, not production hosting.
 - **10 free orgo.dev names per Orgo account.**
-- **The API key on the computer can manage that workspace's computers.**
-  - Use a workspace-scoped key: `orgo api-keys create --workspace <id>`.
+- **The API key on the computer can manage every computer it can see.** Anyone who gets shell on this computer can read it.
+  - Use a workspace-scoped key for a workspace that holds only your deploy computers: `orgo api-keys create --workspace <id>`.
+  - Never paste your main account key here.
   - Delete it when you're done.
 - **The app must listen on `$PORT`.** Or tell orgo-deploy its fixed port with `--port`. Don't use port 8080, which Orgo reserves.
-- **Orgo doesn't tell a computer its own ID**, so `setup` finds itself by writing a one-time nonce and reading it back through the API. Set `ORGO_COMPUTER_ID` in `/etc/orgo-deploy/env` to skip that.
+- **Orgo doesn't tell a computer its own ID.** Pass it with `orgo-deploy setup --computer-id <id>` (or set `ORGO_COMPUTER_ID` in `/etc/orgo-deploy/env`). Without it, `setup` writes a one-time nonce file and reads it back through the API from each running Linux computer the key can see, which is one more reason to use a narrow key.
 
 Files:
 
 - Settings: `/etc/orgo-deploy/env` (mode 600).
 - State: `/var/lib/orgo-deploy/apps.json`.
 - Logs: `/var/log/orgo-deploy/`.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability privately and how to run this safely.
+
+## Disclaimer
+
+orgo-deploy is an experimental community tool, provided "as is" without warranty of any kind under the MIT
+license. You are responsible for the apps you deploy, what they expose on the internet, the API keys you put
+on your computers, and any costs. Read the security notes above before deploying anything that holds real data.
 
 ## License
 
